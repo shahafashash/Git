@@ -1,0 +1,3 @@
+import libgit
+
+libgit.main()
