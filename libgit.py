@@ -12,6 +12,58 @@ import os
 import zlib
 
 
+class GitObject:
+    def __init__(self, path: str, obj_type: str, data: bytes = None) -> None:
+        self.path: str = str(
+            Path(pathvalidate.sanitize_filepath(path, platform="auto")).resolve()
+        )
+        self.type: str = obj_type
+        self.size: int = None
+        self.hash: str = None
+        self.data: bytes = None
+
+        # deserialize data if provided
+        if data is not None:
+            self.deserialize(data)
+
+    def serialize(self) -> bytes:
+        """
+        Serialize the object to bytes.
+        """
+        raise NotImplementedError
+
+    def deserialize(self, data: bytes) -> None:
+        """
+        Deserialize the object from bytes.
+        """
+        raise NotImplementedError
+
+    def __str__(self) -> str:
+        """
+        Return a string representation of the object.
+        """
+        raise NotImplementedError
+
+
+class GitBlob(GitObject):
+    def __init__(self, path: str, data: bytes = None) -> None:
+        super().__init__(path, "blob", data)
+        self.size = len(self.data)
+
+        header = f"{self.type} {self.size}\x00".encode("utf-8")
+        header_with_data = header + self.data
+        self.hash = hashlib.sha1(header_with_data).hexdigest()
+
+    def serialize(self) -> bytes:
+        return self.data
+
+    def deserialize(self, data: bytes) -> None:
+        self.data = data
+
+    def __str__(self) -> str:
+        return f"{self.type} {self.size} {self.hash}\n{self.data.decode()}"
+
+
 class GitRepository:
     """Represents a Git repository."""
 
@@ -52,10 +104,135 @@ class GitRepository:
         if not force:
             version = self.config.get("core", "repositoryformatversion")
             if version != "0":
-                print(f"[!] Unsupported repository format: {version}")
+                print(f"Unsupported repository format: {version}")
                 raise ValueError(f"Unsupported repository format: {version}")
 
-        print(f"[+] Initialized empty Git repository in {self.worktree}")
+        print(f"Initialized empty Git repository in {self.worktree}")
+
+    def cat_file(
+        self,
+        object_hash: str,
+        ptype: bool = False,
+        psize: bool = False,
+        pprint: bool = True,
+    ) -> None:
+        """Reads the object from the object store and pretty-prints it's content and metadata.
+
+        Args:
+            object_hash (str): The hash of the object to print.
+            ptype (bool): Whether to print the object type.
+            psize (bool): Whether to print the object size.
+            pprint (bool): Pretty-print the object based on the object type.
+        """
+        # find the object
+        path = self._find_object(object_hash)
+        if path is None:
+            return
+        # read the object
+        obj = self._read_object(path)
+        if pprint:
+            print(obj)
+        elif ptype:
+            print(obj.type)
+        elif psize:
+            print(obj.size)
+        else:
+            print(obj.serialize())
+
+    def hash_object(self, path: str, obj_type: str, write: bool = False) -> None:
+        """Hashes the object at the given path and returns the hash.
+
+        Args:
+            path (str): Path to the object to hash.
+            obj_type (str): The type of the object.
+            write (bool): Whether to write the object to the object store.
+        """
+        # read the object file
+        sanitized_path = pathvalidate.sanitize_filepath(path, platform="auto")
+        resolved_path = Path(sanitized_path).resolve()
+        content = resolved_path.read_bytes()
+        # create the object based on the type
+        if obj_type == "blob":
+            obj = GitBlob(resolved_path, content)
+        elif obj_type == "commit":
+            obj = GitCommit(resolved_path, content)
+        elif obj_type == "tag":
+            obj = GitTag(resolved_path, content)
+        elif obj_type == "tree":
+            obj = GitTree(resolved_path, content)
+        else:
+            raise ValueError(f"Invalid object type: {obj_type}")
+
+        obj_hash = self._write_object(obj, write)
+        print(obj_hash)
+
+    def _read_object(self, hashed_object: str) -> GitObject:
+        """Reads an object from the repository.
+
+        Args:
+            hashed_object (str): The hash of the object.
+
+        Raises:
+            ValueError: If the object's size is invalid.
+            ValueError: If the object's type is invalid.
+
+        Returns:
+            GitObject: The object read from the repository.
+        """
+        # get the path to the object file
+        path = self._get_object_path(hashed_object)
+        # read the compressed object
+        compressed_data = Path(path).read_bytes()
+        # decompress the object
+        data = self._decompress_object(compressed_data)
+        # read the object type
+        type_index = data.find(b" ")
+        object_type = data[:type_index].decode("utf-8")
+        # read the object size
+        size_index = data.find(b"\x00", type_index)
+        object_size = int(data[type_index + 1 : size_index].decode("ascii"))
+        # validate the object size
+        if len(data) != object_size + size_index + 1:
+            raise ValueError(f"Invalid object size: {object_size}")
+        # create the object based on the type
+        data_index = size_index + 1
+        if object_type == "blob":
+            git_object = GitBlob(self, data[data_index:])
+        elif object_type == "tree":
+            git_object = GitTree(self, data[data_index:])
+        elif object_type == "commit":
+            git_object = GitCommit(self, data[data_index:])
+        elif object_type == "tag":
+            git_object = GitTag(self, data[data_index:])
+        else:
+            raise ValueError(f"Invalid object type: {object_type}")
+
+        return git_object
+
+    def _find_object(
+        self, name: str, obj_type: str = None, follow: bool = True
+    ) -> None:
+        # for now, it we only return the name. Will implement later.
+        return name
+
+    def _write_object(self, obj: GitObject, actually_write: bool = True) -> str:
+        # serialize the object
+        data = obj.serialize()
+        # create a header for the object
+        header = f"{obj.type} {len(data)}\x00".encode("utf-8")
+        obj_with_header = header + data
+        # create the object hash
+        object_hash = obj.hash
+
+        if actually_write:
+            # get the path to the object file
+            path = self._get_object_path(object_hash)
+            # compress the object
+            compressed_data = self._compress_object(obj_with_header)
+            # write the compressed object
+            Path(path).write_bytes(compressed_data)
+
+        return object_hash
 
     def _find_index(self) -> str:
         """Finds the index file in the .git directory.
@@ -224,3 +401,55 @@ def main(argv: List[str] = sys.argv[1:]) -> None:
     init.add_argument("repo", nargs="?", default=".", help="Path to the new repo.")
     # bind the action to the function
     init.set_defaults(func=git.init)
+
+    # create a subparser for the cat-file command
+    cat_file = commands.add_parser(
+        "cat-file", help="Show information about a repository object."
+    )
+    # add the type argument
+    cat_file.add_argument(
+        "-t",
+        "--type",
+        choices=["blob", "commit", "tag", "tree"],
+        help="The type of the object.",
+    )
+    # add the size argument
+    cat_file.add_argument(
+        "-s", "--size", action="store_true", help="Show the size of the object."
+    )
+    # add the pretty argument
+    cat_file.add_argument(
+        "-p", "--pretty", action="store_true", help="Pretty print the object."
+    )
+    # add the hash argument
+    cat_file.add_argument("hash", help="The hash of the object.")
+    # bind the action to the function
+    cat_file.set_defaults(func=git.cat_file)
+
+    # create a subparser for the hash-object command
+    hash_object = commands.add_parser(
+        "hash-object", help="Compute the hash of a file or a blob object."
+    )
+    # add the type argument
+    hash_object.add_argument(
+        "-t",
+        "--type",
+        choices=["blob", "commit", "tag", "tree"],
+        default="blob",
+        help="The type of the object.",
+    )
+    # add the write argument
+    hash_object.add_argument(
+        "-w",
+        "--write",
+        action="store_true",
+        help="Write the object into the object database.",
+    )
+    # add the path argument
+    hash_object.add_argument(
+        "path",
+        type=sanitize_filepath_arg,
+        help="The path to the file to read the object from.",
+    )
+    # bind the action to the function
+    hash_object.set_defaults(func=git.hash_object)
